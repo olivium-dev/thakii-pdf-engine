@@ -1,0 +1,276 @@
+name: Deploy to Thakii-02 Server
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+        - production
+        - staging
+
+env:
+  PYTHON_VERSION: '3.12'
+  PROJECT_NAME: 'thakii-pdf-engine'
+  DEPLOY_PATH: '/home/ec2-user/thakii-pdf-engine'
+  SERVICE_NAME: 'thakii-pdf-engine'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: Run Tests
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Create virtual environment
+      run: |
+        python -m venv venv
+        source venv/bin/activate
+        pip install --upgrade pip
+        
+    - name: Install core dependencies
+      run: |
+        source venv/bin/activate
+        pip install opencv-python fpdf2 webvtt-py srt numpy pillow parameterized
+        
+    - name: Run unit tests
+      run: |
+        source venv/bin/activate
+        python -m unittest tests.test_time_utils tests.test_subtitle_srt_parser tests.test_subtitle_webvtt_parser -v
+        
+    - name: Test basic functionality
+      run: |
+        source venv/bin/activate
+        # Create a simple test video
+        python -c "
+        import cv2
+        import numpy as np
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter('test.mp4', fourcc, 20.0, (640, 480))
+        for i in range(60):
+            if i < 20:
+                frame = np.full((480, 640, 3), (255, 0, 0), dtype=np.uint8)
+            elif i < 40:
+                frame = np.full((480, 640, 3), (0, 255, 0), dtype=np.uint8)
+            else:
+                frame = np.full((480, 640, 3), (0, 0, 255), dtype=np.uint8)
+            cv2.putText(frame, f'Slide {i//20 + 1}', (200, 240), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 3)
+            out.write(frame)
+        out.release()
+        print('Test video created')
+        "
+        # Test the application
+        python -m src.main test.mp4 -S -o test_output.pdf
+        ls -la test_output.pdf
+        
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    name: Deploy to Thakii-02
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup SSH
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H thakii-02.fds-1.com >> ~/.ssh/known_hosts || true
+        
+    - name: Install Cloudflared
+      run: |
+        # Download and install cloudflared
+        wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+        sudo dpkg -i cloudflared-linux-amd64.deb || sudo apt-get install -f -y
+        
+    - name: Setup Cloudflare Access
+      run: |
+        # Setup cloudflared with service token
+        echo "${{ secrets.CLOUDFLARE_SERVICE_TOKEN }}" | cloudflared access login --service-token-stdin || true
+        
+    - name: Test SSH Connection
+      run: |
+        ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o ConnectTimeout=30 \
+            -o StrictHostKeyChecking=no \
+            ec2-user@thakii-02.fds-1.com \
+            "echo 'SSH connection successful' && whoami"
+            
+    - name: Create deployment directory
+      run: |
+        ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o StrictHostKeyChecking=no \
+            ec2-user@thakii-02.fds-1.com \
+            "mkdir -p ${{ env.DEPLOY_PATH }}"
+            
+    - name: Stop existing service (if running)
+      run: |
+        ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o StrictHostKeyChecking=no \
+            ec2-user@thakii-02.fds-1.com \
+            "sudo systemctl stop ${{ env.SERVICE_NAME }} || echo 'Service not running'"
+            
+    - name: Backup current deployment
+      run: |
+        ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o StrictHostKeyChecking=no \
+            ec2-user@thakii-02.fds-1.com \
+            "if [ -d ${{ env.DEPLOY_PATH }} ]; then 
+               sudo cp -r ${{ env.DEPLOY_PATH }} ${{ env.DEPLOY_PATH }}.backup.$(date +%Y%m%d_%H%M%S) || true
+             fi"
+             
+    - name: Deploy application files
+      run: |
+        # Create a tarball of the application
+        tar -czf thakii-pdf-engine.tar.gz \
+          --exclude='.git' \
+          --exclude='venv' \
+          --exclude='__pycache__' \
+          --exclude='*.pyc' \
+          --exclude='.pytest_cache' \
+          --exclude='test_*.mp4' \
+          --exclude='*.pdf' \
+          .
+          
+        # Copy to server
+        scp -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o StrictHostKeyChecking=no \
+            thakii-pdf-engine.tar.gz \
+            ec2-user@thakii-02.fds-1.com:/tmp/
+            
+        # Extract on server
+        ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o StrictHostKeyChecking=no \
+            ec2-user@thakii-02.fds-1.com \
+            "cd ${{ env.DEPLOY_PATH }} && 
+             tar -xzf /tmp/thakii-pdf-engine.tar.gz --strip-components=0 &&
+             rm /tmp/thakii-pdf-engine.tar.gz"
+             
+    - name: Setup Python environment on server
+      run: |
+        ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o StrictHostKeyChecking=no \
+            ec2-user@thakii-02.fds-1.com \
+            "cd ${{ env.DEPLOY_PATH }} &&
+             python3 -m venv venv &&
+             source venv/bin/activate &&
+             pip install --upgrade pip &&
+             pip install opencv-python fpdf2 webvtt-py srt numpy pillow &&
+             echo 'Python environment setup complete'"
+             
+    - name: Install system dependencies
+      run: |
+        ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o StrictHostKeyChecking=no \
+            ec2-user@thakii-02.fds-1.com \
+            "sudo apt-get update -qq &&
+             sudo apt-get install -y python3-opencv libgl1-mesa-glx libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1 || true"
+             
+    - name: Test deployment
+      run: |
+        ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o StrictHostKeyChecking=no \
+            ec2-user@thakii-02.fds-1.com \
+            "cd ${{ env.DEPLOY_PATH }} &&
+             source venv/bin/activate &&
+             python -c 'from src.main import CommandLineArgRunner; print(\"Application imported successfully\")' &&
+             python -m src.main --help"
+             
+    - name: Create systemd service file
+      run: |
+        ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o StrictHostKeyChecking=no \
+            ec2-user@thakii-02.fds-1.com \
+            "sudo tee /etc/systemd/system/${{ env.SERVICE_NAME }}.service > /dev/null << 'EOF'
+        [Unit]
+        Description=Thakii PDF Engine Service
+        After=network.target
+        
+        [Service]
+        Type=simple
+        User=ec2-user
+        Group=ec2-user
+        WorkingDirectory=${{ env.DEPLOY_PATH }}
+        Environment=PATH=${{ env.DEPLOY_PATH }}/venv/bin
+        ExecStart=${{ env.DEPLOY_PATH }}/venv/bin/python -m src.main
+        Restart=always
+        RestartSec=10
+        StandardOutput=journal
+        StandardError=journal
+        SyslogIdentifier=${{ env.SERVICE_NAME }}
+        
+        [Install]
+        WantedBy=multi-user.target
+        EOF"
+        
+    - name: Enable and start service
+      run: |
+        ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o StrictHostKeyChecking=no \
+            ec2-user@thakii-02.fds-1.com \
+            "sudo systemctl daemon-reload &&
+             sudo systemctl enable ${{ env.SERVICE_NAME }} &&
+             echo 'Service configured successfully'"
+             
+    - name: Create deployment info
+      run: |
+        ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o StrictHostKeyChecking=no \
+            ec2-user@thakii-02.fds-1.com \
+            "cd ${{ env.DEPLOY_PATH }} &&
+             echo 'Deployment Info:' > deployment_info.txt &&
+             echo 'Date: $(date)' >> deployment_info.txt &&
+             echo 'Commit: ${{ github.sha }}' >> deployment_info.txt &&
+             echo 'Branch: ${{ github.ref_name }}' >> deployment_info.txt &&
+             echo 'Deployed by: ${{ github.actor }}' >> deployment_info.txt &&
+             cat deployment_info.txt"
+             
+    - name: Verify deployment
+      run: |
+        ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o StrictHostKeyChecking=no \
+            ec2-user@thakii-02.fds-1.com \
+            "cd ${{ env.DEPLOY_PATH }} &&
+             source venv/bin/activate &&
+             python -c 'print(\"✅ Deployment verification successful\")' &&
+             ls -la &&
+             echo '✅ Deployment completed successfully!'"
+
+  notify:
+    needs: [test, deploy]
+    runs-on: ubuntu-latest
+    name: Notify Deployment Status
+    if: always()
+    
+    steps:
+    - name: Notify Success
+      if: needs.deploy.result == 'success'
+      run: |
+        echo "🎉 Deployment to thakii-02.fds-1.com completed successfully!"
+        echo "Commit: ${{ github.sha }}"
+        echo "Branch: ${{ github.ref_name }}"
+        echo "Deployed by: ${{ github.actor }}"
+        
+    - name: Notify Failure
+      if: needs.deploy.result == 'failure' || needs.test.result == 'failure'
+      run: |
+        echo "❌ Deployment failed!"
+        echo "Please check the logs for details."
+        exit 1
