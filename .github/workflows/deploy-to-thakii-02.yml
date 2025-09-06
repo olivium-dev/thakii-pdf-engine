@@ -138,7 +138,7 @@ jobs:
              
     - name: Deploy application files
       run: |
-        # Create a tarball of the application
+        # Create a tarball of the application (exclude problematic files)
         tar -czf thakii-pdf-engine.tar.gz \
           --exclude='.git' \
           --exclude='venv' \
@@ -147,6 +147,8 @@ jobs:
           --exclude='.pytest_cache' \
           --exclude='test_*.mp4' \
           --exclude='*.pdf' \
+          --exclude='*.tar.gz' \
+          --warning=no-file-changed \
           .
           
         # Copy to server
@@ -159,9 +161,16 @@ jobs:
         ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
             -o StrictHostKeyChecking=no \
             ec2-user@thakii-02.fds-1.com \
-            "cd ${{ env.DEPLOY_PATH }} && 
-             tar -xzf /tmp/thakii-pdf-engine.tar.gz --strip-components=0 &&
-             rm /tmp/thakii-pdf-engine.tar.gz"
+            "cd /home/ec2-user && 
+             rm -rf thakii-pdf-engine-new &&
+             mkdir -p thakii-pdf-engine-new &&
+             cd thakii-pdf-engine-new &&
+             tar -xzf /tmp/thakii-pdf-engine.tar.gz &&
+             rm /tmp/thakii-pdf-engine.tar.gz &&
+             cd .. &&
+             rm -rf thakii-pdf-engine-old &&
+             mv thakii-pdf-engine thakii-pdf-engine-old || true &&
+             mv thakii-pdf-engine-new thakii-pdf-engine"
              
     - name: Setup Python environment on server
       run: |
