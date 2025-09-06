@@ -142,7 +142,9 @@ User=${USER}
 Group=${USER}
 WorkingDirectory=${DEPLOY_PATH}
 Environment=PATH=${DEPLOY_PATH}/venv/bin
-ExecStart=${DEPLOY_PATH}/venv/bin/python -m src.main
+ExecStart=${DEPLOY_PATH}/venv/bin/python -m src.health_server
+Environment=HEALTH_PORT=8080
+Environment=HEALTH_HOST=0.0.0.0
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -186,10 +188,33 @@ EOF"
 health_check() {
     log_info "Performing health check on ${SERVER}..."
     
+    # Test basic import
     ssh_exec "cd ${DEPLOY_PATH} &&
               source venv/bin/activate &&
-              python -c 'from src.main import CommandLineArgRunner; print(\"✅ Application is healthy\")' &&
-              sudo systemctl status ${SERVICE_NAME} --no-pager || echo 'Service not running'"
+              python -c 'from src.main import CommandLineArgRunner; print(\"✅ Application is healthy\")'"
+    
+    # Test service status
+    ssh_exec "sudo systemctl status ${SERVICE_NAME} --no-pager || echo 'Service not running'"
+    
+    # Test health endpoint if service is running
+    if ssh_exec "sudo systemctl is-active ${SERVICE_NAME} >/dev/null 2>&1"; then
+        log_info "Testing health endpoint..."
+        sleep 5  # Wait for server to start
+        
+        if ssh_exec "curl -f -s http://localhost:8080/health >/dev/null 2>&1"; then
+            log_success "✅ Health endpoint is responding"
+            log_info "🌐 Health endpoint: http://localhost:8080/health"
+            log_info "📋 Service info: http://localhost:8080/"
+            
+            # Show health response
+            log_info "Health response:"
+            ssh_exec "curl -s http://localhost:8080/health | python3 -m json.tool 2>/dev/null || curl -s http://localhost:8080/health"
+        else
+            log_warning "⚠️  Health endpoint not responding (service may still be starting)"
+        fi
+    else
+        log_info "Service not running, skipping health endpoint test"
+    fi
 }
 
 # Rollback function

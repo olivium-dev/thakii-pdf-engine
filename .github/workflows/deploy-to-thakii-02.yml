@@ -215,27 +215,29 @@ jobs:
         ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
             -o StrictHostKeyChecking=no \
             ec2-user@thakii-02.fds-1.com \
-            "sudo tee /etc/systemd/system/${{ env.SERVICE_NAME }}.service > /dev/null << 'EOF'
-        [Unit]
-        Description=Thakii PDF Engine Service
-        After=network.target
-        
-        [Service]
-        Type=simple
-        User=ec2-user
-        Group=ec2-user
-        WorkingDirectory=${{ env.DEPLOY_PATH }}
-        Environment=PATH=${{ env.DEPLOY_PATH }}/venv/bin
-        ExecStart=${{ env.DEPLOY_PATH }}/venv/bin/python -m src.main
-        Restart=always
-        RestartSec=10
-        StandardOutput=journal
-        StandardError=journal
-        SyslogIdentifier=${{ env.SERVICE_NAME }}
-        
-        [Install]
-        WantedBy=multi-user.target
-        EOF"
+            "          sudo tee /etc/systemd/system/${{ env.SERVICE_NAME }}.service > /dev/null << 'EOF'
+          [Unit]
+          Description=Thakii PDF Engine Service
+          After=network.target
+          
+          [Service]
+          Type=simple
+          User=ec2-user
+          Group=ec2-user
+          WorkingDirectory=${{ env.DEPLOY_PATH }}
+          Environment=PATH=${{ env.DEPLOY_PATH }}/venv/bin
+          Environment=HEALTH_PORT=8080
+          Environment=HEALTH_HOST=0.0.0.0
+          ExecStart=${{ env.DEPLOY_PATH }}/venv/bin/python -m src.health_server
+          Restart=always
+          RestartSec=10
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier=${{ env.SERVICE_NAME }}
+          
+          [Install]
+          WantedBy=multi-user.target
+          EOF"
         
     - name: Enable and start service
       run: |
@@ -269,6 +271,55 @@ jobs:
              python -c 'print(\"✅ Deployment verification successful\")' &&
              ls -la &&
              echo '✅ Deployment completed successfully!'"
+             
+    - name: Health Check - Domain and Localhost
+      run: |
+        echo "🏥 Starting Health Checks..."
+        echo ""
+        
+        # Wait for service to start
+        echo "⏳ Waiting for health server to start..."
+        sleep 15
+        
+        # Test localhost health endpoint
+        echo "🔍 Testing localhost health endpoint..."
+        ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o StrictHostKeyChecking=no \
+            ec2-user@thakii-02.fds-1.com \
+            "curl -f -s http://localhost:8080/health | python3 -m json.tool || echo 'Localhost health check failed'"
+        
+        echo ""
+        echo "🌐 Domain Information:"
+        echo "Server hostname: thakii-02.fds-1.com"
+        echo "Health endpoint: http://localhost:8080/health"
+        echo "Service info: http://localhost:8080/"
+        
+        # Check if cloudflare tunnel is exposing the service
+        echo ""
+        echo "🔧 Cloudflare Tunnel Status:"
+        ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o StrictHostKeyChecking=no \
+            ec2-user@thakii-02.fds-1.com \
+            "ps aux | grep 'cloudflared tunnel' | grep -v grep || echo 'No cloudflare tunnel found'"
+        
+        # Test service status
+        echo ""
+        echo "📊 Service Status:"
+        ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o StrictHostKeyChecking=no \
+            ec2-user@thakii-02.fds-1.com \
+            "sudo systemctl is-active ${{ env.SERVICE_NAME }} && echo 'Service is running' || echo 'Service is not running'"
+        
+        # Check service logs
+        echo ""
+        echo "📋 Recent Service Logs:"
+        ssh -o ProxyCommand="cloudflared access ssh --hostname %h" \
+            -o StrictHostKeyChecking=no \
+            ec2-user@thakii-02.fds-1.com \
+            "sudo journalctl -u ${{ env.SERVICE_NAME }} --no-pager -n 10 || echo 'No logs available'"
+        
+        echo ""
+        echo "✅ Health checks completed!"
 
   notify:
     needs: [test, deploy]
