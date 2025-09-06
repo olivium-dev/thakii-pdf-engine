@@ -148,7 +148,15 @@ jobs:
           --exclude='test_*.mp4' \
           --exclude='*.pdf' \
           --exclude='*.tar.gz' \
-          --warning=no-file-changed \
+          . 2>/dev/null || tar -czf thakii-pdf-engine.tar.gz \
+          --exclude='.git' \
+          --exclude='venv' \
+          --exclude='__pycache__' \
+          --exclude='*.pyc' \
+          --exclude='.pytest_cache' \
+          --exclude='test_*.mp4' \
+          --exclude='*.pdf' \
+          --exclude='*.tar.gz' \
           .
           
         # Copy to server
