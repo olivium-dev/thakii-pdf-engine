@@ -142,9 +142,9 @@ User=${USER}
 Group=${USER}
 WorkingDirectory=${DEPLOY_PATH}
 Environment=PATH=${DEPLOY_PATH}/venv/bin
-ExecStart=${DEPLOY_PATH}/venv/bin/python -m src.health_server
 Environment=HEALTH_PORT=8080
 Environment=HEALTH_HOST=0.0.0.0
+ExecStart=${DEPLOY_PATH}/venv/bin/python -m src.health_server
 Restart=always
 RestartSec=10
 StandardOutput=journal
