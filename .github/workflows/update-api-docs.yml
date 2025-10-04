@@ -1,0 +1,98 @@
+name: Update API Documentation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master, main ]
+    paths:
+      - '**/*.py'
+      - 'requirements.txt'
+      - 'setup.py'
+
+jobs:
+  update-docs:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout thakii-pdf-engine
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || echo "Some dependencies failed"; fi
+          pip install flasgger flask-restx fastapi pydantic || echo "API doc tools install attempted"
+
+      - name: Generate OpenAPI/Swagger
+        run: |
+          echo "Attempting to generate API documentation..."
+          
+          # Try to find and run the main application
+          MAIN_FILE=$(find . -name "main.py" -o -name "app.py" -o -name "server.py" | grep -v test | grep -v __pycache__ | head -1)
+          
+          if [ -z "$MAIN_FILE" ]; then
+            echo "No main file found, creating minimal swagger.json"
+            echo '{"openapi":"3.0.0","info":{"title":"thakii-pdf-engine","version":"1.0.0"},"paths":{}}' > swagger.json
+          else
+            echo "Found main file: $MAIN_FILE"
+            
+            # Try to start the service and fetch swagger
+            timeout 10s python $MAIN_FILE &
+            APP_PID=$!
+            sleep 5
+            
+            # Try common OpenAPI/Swagger endpoints
+            curl -s http://localhost:8080/openapi.json > swagger.json 2>/dev/null || \
+            curl -s http://localhost:8080/api/openapi.json > swagger.json 2>/dev/null || \
+            curl -s http://localhost:5000/swagger.json > swagger.json 2>/dev/null || \
+            curl -s http://localhost:5000/api/swagger.json > swagger.json 2>/dev/null || \
+            curl -s http://localhost:3000/openapi.json > swagger.json 2>/dev/null || \
+            curl -s http://localhost:8000/openapi.json > swagger.json 2>/dev/null || \
+            echo '{"openapi":"3.0.0","info":{"title":"thakii-pdf-engine","version":"1.0.0"},"paths":{}}' > swagger.json
+            
+            kill $APP_PID 2>/dev/null || true
+          fi
+          
+          # Ensure swagger.json exists
+          if [ ! -f swagger.json ] || [ ! -s swagger.json ]; then
+            echo '{"openapi":"3.0.0","info":{"title":"thakii-pdf-engine","version":"1.0.0"},"paths":{}}' > swagger.json
+          fi
+
+      - name: Check API_DOCS_TOKEN
+        id: check_token
+        run: |
+          if [ -n "${{ secrets.API_DOCS_TOKEN }}" ]; then
+            echo "token_available=true" >> $GITHUB_OUTPUT
+          else
+            echo "token_available=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout API docs repository
+        if: steps.check_token.outputs.token_available == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: olivium-dev/olivium-api-docs
+          token: ${{ secrets.API_DOCS_TOKEN }}
+          path: api-docs
+
+      - name: Update documentation
+        if: steps.check_token.outputs.token_available == 'true'
+        run: |
+          mkdir -p api-docs/thakii-pdf-engine
+          cp swagger.json api-docs/thakii-pdf-engine/
+          [ -f README.md ] && cp README.md api-docs/thakii-pdf-engine/
+
+      - name: Commit and push changes
+        if: steps.check_token.outputs.token_available == 'true'
+        working-directory: ./api-docs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add thakii-pdf-engine/
+          git diff --staged --quiet || git commit -m "Update thakii-pdf-engine API documentation"
+          git push
+
