@@ -7,7 +7,7 @@ on:
     paths:
       - '**/*.py'
       - 'requirements.txt'
-      - 'setup.py'
+      - 'requirement.txt'
 
 jobs:
   update-docs:
@@ -24,43 +24,198 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt || echo "Some dependencies failed"; fi
-          pip install flasgger flask-restx fastapi pydantic || echo "API doc tools install attempted"
+          if [ -f requirements.txt ]; then 
+            pip install -r requirements.txt || echo "Some dependencies failed, continuing..."
+          elif [ -f requirement.txt ]; then 
+            pip install -r requirement.txt || echo "Some dependencies failed, continuing..."
+          fi
 
-      - name: Generate OpenAPI/Swagger
+      - name: Patch code to skip database connections
         run: |
-          echo "Attempting to generate API documentation..."
+          echo "Creating patch to skip database connections..."
+          cat > patch_skip_db.py << 'EOF'
+          import re
+          import os
           
-          # Try to find and run the main application
-          MAIN_FILE=$(find . -name "main.py" -o -name "app.py" -o -name "server.py" | grep -v test | grep -v __pycache__ | head -1)
+          def patch_main_file():
+              # Find main.py file
+              main_files = ['main.py', 'app.py', 'Main.py', 'server.py']
+              target_file = None
+              
+              for f in main_files:
+                  if os.path.exists(f):
+                      target_file = f
+                      break
+              
+              if not target_file:
+                  print("No main file found, searching in subdirectories...")
+                  import glob
+                  files = glob.glob("**/main.py", recursive=True) + glob.glob("**/app.py", recursive=True)
+                  if files:
+                      target_file = files[0]
+              
+              if not target_file:
+                  print("Could not find main application file")
+                  return False
+              
+              print(f"Patching {target_file}...")
+              
+              with open(target_file, 'r') as f:
+                  content = f.read()
+              
+              # Check if already patched
+              if 'SKIP_DB' in content and 'skip database' in content.lower():
+                  print("File already has SKIP_DB support")
+                  return True
+              
+              # Patch MongoDB/Motor connections
+              if 'AsyncIOMotorClient' in content or 'MongoClient' in content:
+                  # Add SKIP_DB check before MongoDB connection
+                  mongo_pattern = r'(client\s*=\s*AsyncIOMotorClient\([^)]+\))'
+                  if re.search(mongo_pattern, content):
+                      replacement = r'''# Skip DB connection if SKIP_DB is set
+          SKIP_DB = os.getenv("SKIP_DB", "false").lower() == "true"
+          if SKIP_DB:
+              print("⚠️  SKIP_DB enabled - using mock database client")
+              from unittest.mock import MagicMock
+              client = MagicMock()
+              db = MagicMock()
+          else:
+              \1'''
+                      content = re.sub(mongo_pattern, replacement, content)
+                  
+                  # Also patch db assignment
+                  content = re.sub(
+                      r'(db\s*=\s*client\[[^\]]+\])',
+                      r'if not SKIP_DB:\n    \1',
+                      content
+                  )
+              
+              # Patch PostgreSQL/SQLAlchemy connections
+              if 'create_engine' in content or 'create_async_engine' in content:
+                  engine_pattern = r'(engine\s*=\s*create[^(]*engine\([^)]+\))'
+                  if re.search(engine_pattern, content):
+                      replacement = r'''# Skip DB connection if SKIP_DB is set
+          SKIP_DB = os.getenv("SKIP_DB", "false").lower() == "true"
+          if SKIP_DB:
+              print("⚠️  SKIP_DB enabled - using mock database engine")
+              from unittest.mock import MagicMock
+              engine = MagicMock()
+          else:
+              \1'''
+                      content = re.sub(engine_pattern, replacement, content)
+              
+              # Write patched content
+              with open(target_file, 'w') as f:
+                  f.write(content)
+              
+              print(f"✅ Successfully patched {target_file}")
+              return True
+          
+          if __name__ == "__main__":
+              import sys
+              success = patch_main_file()
+              sys.exit(0 if success else 1)
+          EOF
+          
+          python patch_skip_db.py || echo "Patching not needed or failed, will try without patch"
+
+      - name: Generate OpenAPI Documentation
+        env:
+          SKIP_DB: "true"
+          MONGODB_USERNAME: dummy
+          MONGODB_PASSWORD: dummy
+          MONGODB_CLUSTER: dummy.mongodb.net
+          MONGODB_DATABASE: dummy
+          DATABASE_URL: sqlite:///./dummy.db
+        run: |
+          echo "Starting FastAPI application with SKIP_DB=true..."
+          
+          # Find main application file
+          MAIN_FILE=$(find . -maxdepth 2 -name "main.py" -o -name "app.py" -o -name "Main.py" | grep -v test | grep -v __pycache__ | head -1)
           
           if [ -z "$MAIN_FILE" ]; then
-            echo "No main file found, creating minimal swagger.json"
-            echo '{"openapi":"3.0.0","info":{"title":"thakii-pdf-engine","version":"1.0.0"},"paths":{}}' > swagger.json
-          else
-            echo "Found main file: $MAIN_FILE"
-            
-            # Try to start the service and fetch swagger
-            timeout 10s python $MAIN_FILE &
-            APP_PID=$!
-            sleep 5
-            
-            # Try common OpenAPI/Swagger endpoints
-            curl -s http://localhost:8080/openapi.json > swagger.json 2>/dev/null || \
-            curl -s http://localhost:8080/api/openapi.json > swagger.json 2>/dev/null || \
-            curl -s http://localhost:5000/swagger.json > swagger.json 2>/dev/null || \
-            curl -s http://localhost:5000/api/swagger.json > swagger.json 2>/dev/null || \
-            curl -s http://localhost:3000/openapi.json > swagger.json 2>/dev/null || \
-            curl -s http://localhost:8000/openapi.json > swagger.json 2>/dev/null || \
-            echo '{"openapi":"3.0.0","info":{"title":"thakii-pdf-engine","version":"1.0.0"},"paths":{}}' > swagger.json
-            
-            kill $APP_PID 2>/dev/null || true
+              echo "No main file found in root, searching subdirectories..."
+              MAIN_FILE=$(find . -name "main.py" -o -name "app.py" | grep -v test | grep -v __pycache__ | head -1)
           fi
           
-          # Ensure swagger.json exists
-          if [ ! -f swagger.json ] || [ ! -s swagger.json ]; then
-            echo '{"openapi":"3.0.0","info":{"title":"thakii-pdf-engine","version":"1.0.0"},"paths":{}}' > swagger.json
+          if [ -z "$MAIN_FILE" ]; then
+              echo "❌ Could not find main application file"
+              exit 1
           fi
+          
+          echo "Found main file: $MAIN_FILE"
+          
+          # Try to extract OpenAPI schema directly without running server
+          cat > extract_openapi.py << 'EXTRACT_EOF'
+          import json
+          import sys
+          import os
+          
+          os.environ["SKIP_DB"] = "true"
+          os.environ.setdefault("MONGODB_USERNAME", "dummy")
+          os.environ.setdefault("MONGODB_PASSWORD", "dummy")
+          os.environ.setdefault("MONGODB_CLUSTER", "dummy.mongodb.net")
+          os.environ.setdefault("MONGODB_DATABASE", "dummy")
+          
+          try:
+              # Try to import the app
+              main_file = sys.argv[1] if len(sys.argv) > 1 else "main"
+              module_name = main_file.replace("./", "").replace(".py", "").replace("/", ".")
+              
+              print(f"Importing module: {module_name}")
+              
+              if "/" in main_file:
+                  # Add parent directory to path
+                  parent_dir = "/".join(main_file.split("/")[:-1])
+                  if parent_dir:
+                      sys.path.insert(0, parent_dir)
+                  module_name = main_file.split("/")[-1].replace(".py", "")
+              
+              module = __import__(module_name)
+              
+              # Find FastAPI app instance
+              app = None
+              if hasattr(module, 'app'):
+                  app = module.app
+              elif hasattr(module, 'application'):
+                  app = module.application
+              elif hasattr(module, 'api'):
+                  app = module.api
+              
+              if app is None:
+                  print("❌ Could not find FastAPI app instance")
+                  sys.exit(1)
+              
+              # Get OpenAPI schema
+              openapi_schema = app.openapi()
+              
+              # Write to file
+              with open("swagger.json", "w") as f:
+                  json.dump(openapi_schema, f, indent=2)
+              
+              print("✅ OpenAPI schema extracted successfully!")
+              print(f"Title: {openapi_schema.get('info', {}).get('title')}")
+              print(f"Version: {openapi_schema.get('info', {}).get('version')}")
+              print(f"Paths: {len(openapi_schema.get('paths', {}))}")
+              
+          except Exception as e:
+              print(f"❌ Error: {e}")
+              import traceback
+              traceback.print_exc()
+              sys.exit(1)
+          EXTRACT_EOF
+          
+          python extract_openapi.py "$MAIN_FILE"
+          
+          # Validate swagger.json
+          if [ ! -f swagger.json ] || [ ! -s swagger.json ]; then
+            echo "❌ Failed to generate swagger.json"
+            exit 1
+          fi
+          
+          python -m json.tool swagger.json > /dev/null
+          echo "✅ OpenAPI documentation generated and validated!"
 
       - name: Check API_DOCS_TOKEN
         id: check_token
@@ -95,4 +250,3 @@ jobs:
           git add thakii-pdf-engine/
           git diff --staged --quiet || git commit -m "Update thakii-pdf-engine API documentation"
           git push
-
